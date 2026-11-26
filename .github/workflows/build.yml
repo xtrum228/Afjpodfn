@@ -1,36 +1,135 @@
 name: Build Android APK
 
+# Запускаем при пуше в ветку и вручную через кнопку Run workflow
 on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
 
+# Ограничиваем параллельные сборки, чтобы лишние коммиты не тратили время и очереди зря
+concurrency:
+  group: buildozer-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
+  build-apk:
     runs-on: ubuntu-latest
+    # Даём сборке побольше лимита времени, т.к. первая загрузка SDK/NDK/рецептов тяжёлая
+    timeout-minutes: 90
+
+    env:
+      # Принимаем лицензии Android SDK автоматически, чтобы сборка не зависала на интерактивных вопросах
+      ANDROID_SDK_ROOT: /home/runner/android-sdk
+      ANDROID_HOME: /home/runner/android-sdk
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Xmx3072m"
+      _JAVA_OPTIONS: "-Xmx3072m"
+      # Чтобы pip не падал на потере соединения при скачивании тяжёлых пакетов
+      PIP_RETRIES: "10"
+      PIP_TIMEOUT: "120"
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential libsqlite3-dev sqlite3 bzip2 libbz2-dev libssl-dev openssl libgdbm-dev libgdbm-compat-dev liblldb-dev libffi-dev zlib1g-dev openjdk-17-jdk ffmpeg libsm6 libxext6
-        pip install --upgrade pip
-        pip install buildozer cython
+      - name: Check project files
+        run: |
+          ls -la
+          test -f main.py || (echo "ERROR: main.py not found!" && exit 1)
+          test -f buildozer.spec || (echo "ERROR: buildozer.spec not found!" && exit 1)
 
-    - name: Build APK with Buildozer
-      run: |
-        yes | buildozer -v android debug
+      - name: Cache Buildozer and Android SDK/NDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            /home/runner/android-sdk
+          key: buildozer-cache-${{ runner.os }}-${{ hashFiles('buildozer.spec', 'main.py') }}
+          restore-keys: |
+            buildozer-cache-${{ runner.os }}-
 
-    - name: Upload APK Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: ChessVision-APK
-        path: bin/*.apk
+      - name: Install system packages and build tools
+        run: |
+          set -e
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            git zip unzip openjdk-17-jdk autoconf libtool pkg-config zlib1g-dev \
+            libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev \
+            build-essential libsqlite3-dev sqlite3 bzip2 libbz2-dev libgdbm-dev \
+            libgdbm-compat-dev liblldb-dev uuid-dev liblzma-dev tk-dev \
+            ffmpeg libsm6 libxext6 libxrender1 libgl1-mesa-glx \
+            ccache patchelf python3-pip python3-setuptools
+
+      - name: Install Python build dependencies
+        run: |
+          set -e
+          python -m pip install --upgrade pip wheel setuptools
+          pip install --retries 10 --timeout 120 "cython<3.0" buildozer virtualenv
+
+      - name: Ensure buildozer.spec has safe Android settings
+        run: |
+          python3 - << 'EOF'
+          from pathlib import Path
+
+          spec_path = Path("buildozer.spec")
+          text = spec_path.read_text(encoding="utf-8")
+
+          # Если стоит accept_sdk_license = False, меняем на True
+          text = text.replace("android.accept_sdk_license = False", "android.accept_sdk_license = True")
+
+          spec_path.write_text(text, encoding="utf-8")
+          print("buildozer.spec checked and updated where needed.")
+          EOF
+
+      - name: Run Buildozer (with retry on transient network/download errors)
+        run: |
+          set -o pipefail
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
+
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "=== Buildozer attempt $ATTEMPT of $MAX_ATTEMPTS ==="
+            # yes автоматически отвечает 'y' на запросы лицензий/подтверждений
+            if yes | buildozer -v android debug 2>&1 | tee buildozer.log; then
+              echo "Buildozer succeeded on attempt $ATTEMPT!"
+              exit 0
+            fi
+
+            echo "Attempt $ATTEMPT failed. Checking if it's worth retrying..."
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              echo "Cleaning partial build state if needed and waiting 10s before retry..."
+              sleep 10
+              ATTEMPT=$((ATTEMPT + 1))
+            else
+              echo "All $MAX_ATTEMPTS attempts failed."
+              exit 1
+            fi
+          done
+
+      - name: Verify APK exists
+        run: |
+          ls -la bin/ || true
+          ls -la bin/*.apk
+
+      - name: Upload APK Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChessVision-APK
+          path: bin/*.apk
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload Buildozer log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildozer-failure-logs
+          path: buildozer.log
+          if-no-files-found: ignore
+          retention-days: 7
